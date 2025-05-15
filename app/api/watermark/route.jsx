@@ -504,11 +504,21 @@ function allowedFile(filename) {
     return ext && ALLOWED_EXTENSIONS.has(ext);
 }
 
+function escapeXml(text) {
+    return text
+        .replace(/&/g, "&")
+        .replace(/</g, "<")
+        .replace(/>/g, ">")
+        .replace(/"/g, """)
+            .replace(/'/g, "'");
+}
+
 export async function POST(request) {
     try {
         const formData = await request.formData();
         const imageFile = formData.get("image");
         const logoFile = formData.get("logo");
+        const textOverlay = formData.get("textOverlay");
         const watermarkType = formData.get("watermark_type");
         const watermarkText = formData.get("watermark_text");
         const watermarkX = parseInt(formData.get("watermark_x")) || 0;
@@ -525,6 +535,8 @@ export async function POST(request) {
             watermarkType,
             rotationAngle,
             opacity: watermarkOpacity,
+            watermarkText,
+            hasTextOverlay: !!textOverlay,
         });
 
         if (!imageFile || !allowedFile(imageFile.name)) {
@@ -535,7 +547,7 @@ export async function POST(request) {
             return NextResponse.json({ error: "Invalid or missing logo file" }, { status: 400 });
         }
 
-        // Step 1: Resize the base image to max height 600
+        // Resize base image
         const imageBuffer = Buffer.from(await imageFile.arrayBuffer());
         const maxHeight = 600;
         const resizedImageBuffer = await sharp(imageBuffer)
@@ -563,54 +575,90 @@ export async function POST(request) {
         let compositeLeft = watermarkX;
 
         if (watermarkType === "text") {
-            if (!watermarkText) {
-                return NextResponse.json({ error: "No text provided for text watermark" }, { status: 400 });
+            if (!watermarkText || typeof watermarkText !== "string") {
+                return NextResponse.json({ error: "No valid text provided for text watermark" }, { status: 400 });
             }
 
-            const fontSize = Math.max(10, Math.min(watermarkSize, Math.floor(metadata.width * 0.1)));
-            const textWidth = Math.min(watermarkText.length * fontSize * 0.6, metadata.width * 0.8);
-            const textHeight = fontSize * 1.2;
-            const svgWidth = Math.floor(Math.min(textWidth, metadata.width));
-            const svgHeight = Math.floor(Math.min(textHeight, metadata.height));
+            if (textOverlay) {
+                // Use client-rendered text PNG
+                overlayBuffer = Buffer.from(await textOverlay.arrayBuffer());
+                const overlayMetadata = await sharp(overlayBuffer).metadata();
+                console.log("Text Overlay Metadata (Client PNG):", {
+                    width: overlayMetadata.width,
+                    height: overlayMetadata.height,
+                    fontSize: watermarkSize,
+                    composite: { top: compositeTop, left: compositeLeft },
+                });
 
-            compositeTop = Math.max(0, Math.min(watermarkY, metadata.height - svgHeight));
-            compositeLeft = Math.max(0, Math.min(watermarkX, metadata.width - svgWidth));
+                compositeTop = Math.max(0, Math.min(watermarkY, metadata.height - overlayMetadata.height));
+                compositeLeft = Math.max(0, Math.min(watermarkX, metadata.width - overlayMetadata.width));
+            } else {
+                // Fallback SVG rendering
+                const fontSize = Math.max(10, watermarkSize);
+                const textWidth = watermarkText.length * fontSize * 0.75;
+                const textHeight = fontSize * 1.5;
+                const svgWidth = Math.floor(Math.min(textWidth, metadata.width * 0.8));
+                const svgHeight = Math.floor(Math.min(textHeight, metadata.height));
 
-            const svgText = `
-                <svg width="${svgWidth}" height="${svgHeight}">
-                    <text
-                        x="0"
-                        y="${fontSize}"
-                        font-family="Helvetica, Arial, sans-serif"
-                        font-size="${fontSize}"
-                        fill="${watermarkColor}"
-                        opacity="${watermarkOpacity}"
-                        ${rotationAngle !== 0 ? `transform="rotate(${rotationAngle}, ${svgWidth / 2}, ${svgHeight / 2})"` : ""}
-                    >
-                        ${watermarkText}
-                    </text>
-                </svg>
-            `;
+                const rad = Math.abs((rotationAngle * Math.PI) / 180);
+                const rotatedWidth = Math.abs(svgWidth * Math.cos(rad)) + Math.abs(svgHeight * Math.sin(rad));
+                const rotatedHeight = Math.abs(svgWidth * Math.sin(rad)) + Math.abs(svgHeight * Math.cos(rad));
+                const finalSvgWidth = Math.floor(Math.min(rotatedWidth, metadata.width * 0.8));
+                const finalSvgHeight = Math.floor(Math.min(rotatedHeight, metadata.height));
 
-            overlayBuffer = await sharp(Buffer.from(svgText)).png().toBuffer();
+                compositeTop = Math.max(0, Math.min(watermarkY, metadata.height - finalSvgHeight));
+                compositeLeft = Math.max(0, Math.min(watermarkX, metadata.width - finalSvgWidth));
+
+                const escapedWatermarkText = escapeXml(watermarkText);
+
+                const svgText = `
+                    <svg width="${finalSvgWidth}" height="${finalSvgHeight}" viewBox="0 0 ${finalSvgWidth} ${finalSvgHeight}">
+                        <text
+                            x="${finalSvgWidth / 2}"
+                            y="${finalSvgHeight / 2}"
+                            font-family="Arial, sans-serif"
+                            font-size="${fontSize}"
+                            fill="${watermarkColor}"
+                            opacity="${watermarkOpacity}"
+                            text-anchor="middle"
+                            dominant-baseline="middle"
+                            ${rotationAngle !== 0 ? `transform="rotate(${rotationAngle}, ${finalSvgWidth / 2}, ${finalSvgHeight / 2})"` : ""}
+                        >
+                            ${escapedWatermarkText}
+                        </text>
+                    </svg>
+                `;
+
+                console.log("Generated SVG (Fallback):", svgText);
+
+                overlayBuffer = await sharp(Buffer.from(svgText))
+                    .png({ quality: 100, force: true, progressive: false, compressionLevel: 0, density: 300 })
+                    .toBuffer();
+
+                const overlayMetadata = await sharp(overlayBuffer).metadata();
+                console.log("Text Overlay Metadata (SVG):", {
+                    width: overlayMetadata.width,
+                    height: overlayMetadata.height,
+                    fontSize,
+                    svg: { width: finalSvgWidth, height: finalSvgHeight },
+                    composite: { top: compositeTop, left: compositeLeft },
+                });
+            }
 
             const overlayMetadata = await sharp(overlayBuffer).metadata();
-            console.log("Text Overlay Metadata:", {
-                width: overlayMetadata.width,
-                height: overlayMetadata.height,
-                composite: { top: compositeTop, left: compositeLeft },
-            });
-
-            // Ensure overlay fits within base image
             if (overlayMetadata.width > metadata.width || overlayMetadata.height > metadata.height) {
+                console.log("Resizing text overlay:", {
+                    original: { width: overlayMetadata.width, height: overlayMetadata.height },
+                    target: { width: metadata.width, height: metadata.height },
+                });
                 overlayBuffer = await sharp(overlayBuffer)
                     .resize({
                         width: Math.floor(Math.min(overlayMetadata.width, metadata.width)),
                         height: Math.floor(Math.min(overlayMetadata.height, metadata.height)),
-                        fit: "inside",
+                        fit: "contain",
                         background: { r: 0, g: 0, b: 0, alpha: 0 },
                     })
-                    .png()
+                    .png({ quality: 100, compressionLevel: 0 })
                     .toBuffer();
             }
         } else {
@@ -628,16 +676,12 @@ export async function POST(request) {
                 hasAlpha: logoMetadata.hasAlpha,
             });
 
-            // Calculate logo size with integer values
-            const maxLogoWidth = Math.floor(Math.min(metadata.width * 0.3, metadata.width * (watermarkSize / 100)));
-            const logoWidth = Math.floor(Math.min(maxLogoWidth, metadata.width));
-            const logoHeight = Math.floor((logoWidth / logoMetadata.width) * logoMetadata.height);
-
-            const finalLogoWidth = Math.floor(Math.min(logoWidth, metadata.width));
+            const logoWidth = Math.floor(metadata.width * (watermarkSize / 100));
+            const logoHeight = Math.floor(logoWidth * (logoMetadata.height / logoMetadata.width));
+            const finalLogoWidth = Math.floor(Math.min(logoWidth, metadata.width * 0.8));
             const finalLogoHeight = Math.floor(Math.min(logoHeight, metadata.height));
 
             console.log("Logo Resize Calculations:", {
-                maxLogoWidth,
                 logoWidth,
                 logoHeight,
                 finalLogoWidth,
@@ -647,7 +691,6 @@ export async function POST(request) {
                 watermarkSize,
             });
 
-            // Process logo with alpha channel
             let logoSharp = sharp(logoBuffer).ensureAlpha();
             logoSharp = logoSharp.resize(finalLogoWidth, finalLogoHeight, {
                 fit: "contain",
@@ -660,7 +703,6 @@ export async function POST(request) {
                 });
             }
 
-            // Convert to buffer with raw pixel data
             let logoWithAlpha = await logoSharp
                 .raw()
                 .toBuffer({ resolveWithObject: true });
@@ -674,7 +716,7 @@ export async function POST(request) {
             }).metadata();
 
             if (!logoWithAlphaMetadata.width || !logoWithAlphaMetadata.height || !logoWithAlphaMetadata.format) {
-                console.error("Invalid logo buffer metadata after processing:", logoWithAlphaMetadata);
+                console.error("Invalid logo buffer metadata after processing:", logoMetadata);
                 return NextResponse.json({ error: "Failed to process logo image" }, { status: 500 });
             }
             if (!logoWithAlphaMetadata.hasAlpha) {
@@ -691,30 +733,23 @@ export async function POST(request) {
                     .toBuffer({ resolveWithObject: true });
             }
 
-            // Apply opacity to alpha channel
             try {
-                // Convert logo to raw RGBA data
                 const { data: logoData, info } = logoWithAlpha;
                 const pixelCount = info.width * info.height;
-
-                // Create a new buffer to adjust alpha
                 const adjustedData = Buffer.alloc(pixelCount * 4);
                 for (let i = 0; i < pixelCount; i++) {
                     const offset = i * 4;
-                    adjustedData[offset] = logoData[offset]; // R
-                    adjustedData[offset + 1] = logoData[offset + 1]; // G
-                    adjustedData[offset + 2] = logoData[offset + 2]; // B
-                    adjustedData[offset + 3] = Math.round(logoData[offset + 3] * watermarkOpacity); // A * opacity
+                    adjustedData[offset] = logoData[offset];
+                    adjustedData[offset + 1] = logoData[offset + 1];
+                    adjustedData[offset + 2] = logoData[offset + 2];
+                    adjustedData[offset + 3] = Math.round(logoData[offset + 3] * watermarkOpacity);
                 }
 
-                // Log sample alpha value
-                const sampleAlpha = adjustedData[3]; // First pixel's alpha
                 console.log("Alpha Channel Sample:", {
-                    sampleAlpha,
+                    sampleAlpha: adjustedData[3],
                     expectedAlpha: Math.round(watermarkOpacity * 255),
                 });
 
-                // Convert back to PNG
                 overlayBuffer = await sharp(adjustedData, {
                     raw: {
                         width: info.width,
@@ -722,11 +757,10 @@ export async function POST(request) {
                         channels: 4,
                     },
                 })
-                    .png({ force: true })
+                    .png({ quality: 100, force: true, compressionLevel: 0 })
                     .toBuffer();
             } catch (alphaError) {
                 console.error("Alpha channel processing failed:", alphaError);
-                // Fallback: Use composite with opacity
                 overlayBuffer = await sharp(logoWithAlpha.data, {
                     raw: {
                         width: finalLogoWidth,
@@ -734,7 +768,7 @@ export async function POST(request) {
                         channels: 4,
                     },
                 })
-                    .png({ force: true })
+                    .png({ quality: 100, force: true, compressionLevel: 0 })
                     .toBuffer();
             }
 
@@ -753,24 +787,6 @@ export async function POST(request) {
                 appliedOpacity: watermarkOpacity,
             });
 
-            // Ensure overlay fits within base image
-            if (overlayMetadata.width > metadata.width || overlayMetadata.height > metadata.height) {
-                console.log("Resizing logo overlay to fit base image:", {
-                    original: { width: overlayMetadata.width, height: overlayMetadata.height },
-                    target: { width: metadata.width, height: metadata.height },
-                });
-                overlayBuffer = await sharp(overlayBuffer)
-                    .resize({
-                        width: Math.floor(Math.min(overlayMetadata.width, metadata.width)),
-                        height: Math.floor(Math.min(overlayMetadata.height, metadata.height)),
-                        fit: "inside",
-                        background: { r: 0, g: 0, b: 0, alpha: 0 },
-                    })
-                    .png({ force: true })
-                    .toBuffer();
-            }
-
-            // Clamp composite coordinates
             compositeTop = Math.max(0, Math.min(watermarkY, metadata.height - overlayMetadata.height));
             compositeLeft = Math.max(0, Math.min(watermarkX, metadata.width - overlayMetadata.width));
         }

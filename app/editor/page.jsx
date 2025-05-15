@@ -463,7 +463,13 @@ export default function Editor() {
     const [displayedDimensions, setDisplayedDimensions] = useState({ width: 0, height: 0 });
     const [imageOffset, setImageOffset] = useState({ x: 0, y: 0 });
 
-    const handleImageUpload = (file) => {
+    const handleImageUpload = async (file) => {
+        // Validate file size (4MB limit for Vercel)
+        if (file.size > 4 * 1024 * 1024) {
+            setMessage({ title: "Error", text: "Image file is too large. Please use an image under 4MB." });
+            return;
+        }
+
         const img = new window.Image();
         img.src = URL.createObjectURL(file);
         img.onload = () => {
@@ -480,8 +486,84 @@ export default function Editor() {
     };
 
     const handleLogoUpload = (file) => {
+        // Validate logo size
+        if (file.size > 1 * 1024 * 1024) {
+            setMessage({ title: "Error", text: "Logo file is too large. Please use a logo under 1MB." });
+            return;
+        }
         setLogoFile(file);
         updateLogoPreview();
+    };
+
+    const compressImage = async (file, maxHeight = 600) => {
+        const img = new window.Image();
+        img.src = URL.createObjectURL(file);
+        await new Promise((resolve) => (img.onload = resolve));
+
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d");
+        const aspectRatio = img.naturalWidth / img.naturalHeight;
+        const height = Math.min(maxHeight, img.naturalHeight);
+        const width = Math.round(height * aspectRatio);
+
+        canvas.width = width;
+        canvas.height = height;
+        ctx.drawImage(img, 0, 0, width, height);
+
+        console.log("Compressed Image:", { width, height, original: { width: img.naturalWidth, height: img.naturalHeight } });
+
+        return new Promise((resolve) => {
+            canvas.toBlob(
+                (blob) => resolve(blob),
+                "image/jpeg",
+                0.8 // 80% quality
+            );
+        });
+    };
+
+    const generateTextOverlay = async () => {
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d");
+        const fontSize = textSize;
+        const font = `${fontSize}px Arial, sans-serif`;
+        ctx.font = font;
+        const textMetrics = ctx.measureText(watermarkText);
+        const width = Math.ceil(textMetrics.width);
+        const height = fontSize * 1.5;
+        canvas.width = width;
+        canvas.height = height;
+
+        // Redraw text
+        ctx.font = font;
+        ctx.fillStyle = textColor;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.globalAlpha = opacity / 100;
+
+        if (rotation !== 0) {
+            ctx.translate(width / 2, height / 2);
+            ctx.rotate((rotation * Math.PI) / 180);
+            ctx.translate(-width / 2, -height / 2);
+        }
+
+        ctx.fillText(watermarkText, width / 2, height / 2);
+
+        console.log("Text Overlay Canvas:", {
+            fontSize,
+            width,
+            height,
+            text: watermarkText,
+            rotation,
+            opacity: opacity / 100,
+        });
+
+        return new Promise((resolve) => {
+            canvas.toBlob(
+                (blob) => resolve(blob),
+                "image/png",
+                1.0 // Max quality for text clarity
+            );
+        });
     };
 
     const handleApplyWatermark = async () => {
@@ -506,7 +588,7 @@ export default function Editor() {
             return;
         }
 
-        // Calculate server-side resized dimensions (same as API)
+        // Calculate server-side resized dimensions
         const maxHeight = 600;
         const aspectRatio = image.naturalWidth / image.naturalHeight;
         let resizedWidth, resizedHeight;
@@ -518,21 +600,25 @@ export default function Editor() {
             resizedWidth = image.naturalWidth;
         }
 
-        // Get watermark dimensions from server-side calculations
-        let watermarkWidth = watermarkType === "text" ? Math.min(watermarkText.length * textSize * 0.6, resizedWidth * 0.8) : (resizedWidth * logoSize) / 100;
-        let watermarkHeight = watermarkType === "text" ? textSize * 1.2 : (watermarkWidth / 2) * 1.75; // Approximate logo aspect ratio
+        // Get watermark dimensions
+        let watermarkWidth, watermarkHeight;
+        if (watermarkType === "text") {
+            watermarkWidth = Math.min(watermarkText.length * textSize * 0.75, resizedWidth * 0.8);
+            watermarkHeight = textSize * 1.5;
+        } else {
+            watermarkWidth = (resizedWidth * logoSize) / 100;
+            watermarkHeight = watermarkWidth * (logoFile ? (await getImageAspectRatio(logoFile)) : 0.5714);
+        }
 
-        // Adjust drag coordinates to be relative to the image's top-left corner
+        // Adjust and scale coordinates
         let adjustedX = image.watermarkPosition.x - imageOffset.x;
         let adjustedY = image.watermarkPosition.y - imageOffset.y;
-
-        // Scale coordinates to resized image dimensions
         const scaleX = resizedWidth / displayedWidth;
         const scaleY = resizedHeight / displayedHeight;
         let scaledX = adjustedX * scaleX;
         let scaledY = adjustedY * scaleY;
 
-        // Clamp coordinates to ensure watermark stays within bounds
+        // Clamp coordinates
         scaledX = Math.max(0, Math.min(scaledX, resizedWidth - watermarkWidth));
         scaledY = Math.max(0, Math.min(scaledY, resizedHeight - watermarkHeight));
 
@@ -541,6 +627,7 @@ export default function Editor() {
             natural: { width: image.naturalWidth, height: image.naturalHeight },
             resized: { width: resizedWidth, height: resizedHeight },
             watermark: { width: watermarkWidth, height: watermarkHeight },
+            fontSize: textSize,
             dragPosition: { x: image.watermarkPosition.x, y: image.watermarkPosition.y },
             imageOffset: { x: imageOffset.x, y: imageOffset.y },
             adjustedPosition: { x: adjustedX, y: adjustedY },
@@ -548,8 +635,11 @@ export default function Editor() {
             scaledPosition: { x: scaledX, y: scaledY },
         });
 
+        // Compress image
+        const compressedImage = await compressImage(image.file, maxHeight);
+
         const formData = new FormData();
-        formData.append("image", image.file);
+        formData.append("image", compressedImage, image.file.name);
         if (logoFile) formData.append("logo", logoFile);
         formData.append("watermark_type", watermarkType);
         formData.append("watermark_text", watermarkText);
@@ -558,7 +648,12 @@ export default function Editor() {
         formData.append("watermark_opacity", (opacity / 100).toString());
         formData.append("watermark_size", (watermarkType === "text" ? textSize : logoSize).toString());
         formData.append("watermark_color", textColor);
-        formData.append("watermark_angle", rotation.toString());
+        formData.append("rotation_angle", rotation.toString());
+
+        if (watermarkType === "text") {
+            const textOverlayBlob = await generateTextOverlay();
+            formData.append("textOverlay", textOverlayBlob, "textOverlay.png");
+        }
 
         try {
             const response = await fetch("/api/watermark", {
@@ -577,7 +672,8 @@ export default function Editor() {
                 setMessage({ title: "Error", text: data.error || "Failed to apply watermark." });
             }
         } catch (error) {
-            setMessage({ title: "Error", text: "An error occurred while applying the watermark." });
+            console.error("Fetch error:", error);
+            setMessage({ title: "Error", text: "An error occurred while applying the watermark. Please try a smaller image." });
         }
     };
 
@@ -592,6 +688,16 @@ export default function Editor() {
         link.click();
     };
 
+    const getImageAspectRatio = async (file) => {
+        return new Promise((resolve) => {
+            const img = new window.Image();
+            img.src = URL.createObjectURL(file);
+            img.onload = () => {
+                resolve(img.naturalHeight / img.naturalWidth);
+            };
+        });
+    };
+
     const updateTextPreview = () => {
         if (!watermarkPreviewRef.current || !previewContainerRef.current || !imageRef.current) return;
         const container = previewContainerRef.current.getBoundingClientRect();
@@ -601,18 +707,25 @@ export default function Editor() {
         watermarkPreviewRef.current.style.color = textColor;
         watermarkPreviewRef.current.style.opacity = (opacity / 100).toString();
         watermarkPreviewRef.current.style.transform = `rotate(${rotation}deg)`;
+        watermarkPreviewRef.current.style.fontFamily = "Arial, sans-serif";
         watermarkPreviewRef.current.textContent = watermarkText;
 
-        // Ensure minimum size for dragging
-        watermarkPreviewRef.current.style.minWidth = `${watermarkText.length * textSize * 0.6}px`;
-        watermarkPreviewRef.current.style.minHeight = `${textSize * 1.2}px`;
+        const calculatedWidth = watermarkText.length * textSize * 0.75;
+        watermarkPreviewRef.current.style.width = `${calculatedWidth}px`;
+        watermarkPreviewRef.current.style.height = `${textSize * 1.5}px`;
 
-        // Force reflow to get accurate dimensions
-        watermarkPreviewRef.current.offsetHeight; // Trigger reflow
+        watermarkPreviewRef.current.offsetHeight;
+        const actualWidth = watermarkPreviewRef.current.offsetWidth;
+        const actualHeight = watermarkPreviewRef.current.offsetHeight;
+        console.log("Text Preview Metrics:", {
+            fontSize: textSize,
+            calculated: { width: calculatedWidth, height: textSize * 1.5 },
+            actual: { width: actualWidth, height: actualHeight },
+        });
 
         if (!image.watermarkPosition.x && !image.watermarkPosition.y) {
-            const watermarkWidth = watermarkPreviewRef.current.offsetWidth;
-            const watermarkHeight = watermarkPreviewRef.current.offsetHeight;
+            const watermarkWidth = actualWidth;
+            const watermarkHeight = actualHeight;
             const initialTop = (imageRect.height - watermarkHeight) / 2 + imageOffset.y;
             const initialLeft = (imageRect.width - watermarkWidth) / 2 + imageOffset.x;
             watermarkPreviewRef.current.style.top = `${initialTop}px`;
@@ -625,7 +738,7 @@ export default function Editor() {
         }
     };
 
-    const updateLogoPreview = () => {
+    const updateLogoPreview = async () => {
         if (!logoPreviewRef.current || !previewContainerRef.current || !logoFile || !imageRef.current) return;
         const container = previewContainerRef.current.getBoundingClientRect();
         const imageRect = imageRef.current.getBoundingClientRect();
@@ -636,8 +749,10 @@ export default function Editor() {
         logoPreviewRef.current.style.opacity = (opacity / 100).toString();
         logoPreviewRef.current.style.transform = `rotate(${rotation}deg)`;
 
-        // Force reflow to get accurate dimensions
-        logoPreviewRef.current.offsetHeight; // Trigger reflow
+        const aspectRatio = await getImageAspectRatio(logoFile);
+        logoPreviewRef.current.style.height = `${(containerWidth * logoSize) / 100 * aspectRatio}px`;
+
+        logoPreviewRef.current.offsetHeight;
 
         if (!image.watermarkPosition.x && !image.watermarkPosition.y) {
             const logoWidth = logoPreviewRef.current.offsetWidth;
@@ -791,6 +906,7 @@ export default function Editor() {
                                             height={600}
                                             className="max-w-full max-h-[600px] object-contain"
                                             style={{ width: "auto", height: "auto" }}
+                                            unoptimized
                                             onLoadingComplete={(img) => {
                                                 const rect = img.getBoundingClientRect();
                                                 setDisplayedDimensions({
